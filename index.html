@@ -11,34 +11,29 @@
   const SSOT_KEY = 'portfolio_ssot';
 
   const L0_ENTITIES = [
-    { entity_id: 'gameplay_layer', source_id: '3458764688487971212', canonical_name: 'Gameplay Layer' },
-
-    { entity_id: 'booster_modifier_system', source_id: '3458764688487772502', canonical_name: 'Booster / Modifier System' },
-    { entity_id: 'automation_system', source_id: '3458764688487772493', canonical_name: 'Automation System' },
-    { entity_id: 'inventory_system', source_id: '3458764688487772489', canonical_name: 'Inventory System' },
-    { entity_id: 'primary_resource_acquisition_system', source_id: '3458764688487772492', canonical_name: 'Primary Resource Acquisition System' },
-    { entity_id: 'production_system', source_id: '3458764688487772491', canonical_name: 'Production System' },
-    { entity_id: 'demand_fulfillment_system', source_id: '3458764688487772488', canonical_name: 'Demand & Fulfillment System' },
-    { entity_id: 'purchase_system', source_id: '3458764688487772500', canonical_name: 'Purchase System' },
-    { entity_id: 'progression_system', source_id: '3458764688487772490', canonical_name: 'Progression System' },
-    { entity_id: 'collections_system', source_id: '3458764688487772505', canonical_name: 'Collections System' },
-    { entity_id: 'social_system', source_id: '3458764688487772487', canonical_name: 'Social System' },
-    { entity_id: 'competition_ranking_system', source_id: '3458764688487772507', canonical_name: 'Competition & Ranking System' },
-
-    { entity_id: 'monetization_layer', source_id: '3458764688487873163', canonical_name: 'Monetization Layer' },
-    { entity_id: 'commerce_system', source_id: '3458764688487772517', canonical_name: 'Commerce System' },
-    { entity_id: 'advertising_system', source_id: '3458764688487772518', canonical_name: 'Advertising System' },
-
-    { entity_id: 'liveops_layer', source_id: '3458764688487873162', canonical_name: 'LiveOps Layer' },
-    { entity_id: 'events_system', source_id: '3458764688487772511', canonical_name: 'Events System' },
-    { entity_id: 'developer_to_player_communication_system', source_id: '3458764688487772510', canonical_name: 'Developer-to-Player Communication System' },
-    { entity_id: 'engagement_reward_system', source_id: '3458764688487772512', canonical_name: 'Engagement & Reward System' },
-
-    { entity_id: 'platform_player_services_layer', source_id: '3458764688487873161', canonical_name: 'Platform & Player Services Layer' },
-    { entity_id: 'platform_player_services_system', source_id: '3458764688487772509', canonical_name: 'Platform & Player Services System' },
-
-    { entity_id: 'tutorial_guidance_layer', source_id: '3458764688490670990', canonical_name: 'Tutorial & Guidance Layer' },
-    { entity_id: 'tutorial_guidance_system', source_id: '3458764688491057330', canonical_name: 'Tutorial & Guidance System' }
+    ['gameplay_layer', 'Gameplay Layer'],
+    ['booster_modifier_system', 'Booster / Modifier System'],
+    ['automation_system', 'Automation System'],
+    ['inventory_system', 'Inventory System'],
+    ['primary_resource_acquisition_system', 'Primary Resource Acquisition System'],
+    ['production_system', 'Production System'],
+    ['demand_fulfillment_system', 'Demand & Fulfillment System'],
+    ['purchase_system', 'Purchase System'],
+    ['progression_system', 'Progression System'],
+    ['collections_system', 'Collections System'],
+    ['social_system', 'Social System'],
+    ['competition_ranking_system', 'Competition & Ranking System'],
+    ['monetization_layer', 'Monetization Layer'],
+    ['commerce_system', 'Commerce System'],
+    ['advertising_system', 'Advertising System'],
+    ['liveops_layer', 'LiveOps Layer'],
+    ['events_system', 'Events System'],
+    ['developer_to_player_communication_system', 'Developer-to-Player Communication System'],
+    ['engagement_reward_system', 'Engagement & Reward System'],
+    ['platform_player_services_layer', 'Platform & Player Services Layer'],
+    ['platform_player_services_system', 'Platform & Player Services System'],
+    ['tutorial_guidance_layer', 'Tutorial & Guidance Layer'],
+    ['tutorial_guidance_system', 'Tutorial & Guidance System']
   ];
 
   function plainText(content) {
@@ -47,41 +42,83 @@
     return (div.textContent ?? '').replace(/\s+/g, ' ').trim();
   }
 
-  async function setupL0() {
-    const shapes = await miro.board.get({ type: 'shape' });
-    const byId = new Map(shapes.map(item => [item.id, item]));
+  async function findOntologyFrame() {
+    const frames = await miro.board.get({ type: 'frame' });
 
+    let frame = frames.find(
+      item => (item.title ?? '').trim().toLowerCase() === 'ontology'
+    );
+
+    if (frame) return frame;
+
+    // Fallback: find a frame that contains a child labelled "Ontology".
+    for (const candidate of frames) {
+      const children = await candidate.getChildren();
+
+      const hasOntologyLabel = children.some(item => {
+        if (item.type !== 'shape' && item.type !== 'text') return false;
+        return plainText(item.content).toLowerCase() === 'ontology';
+      });
+
+      if (hasOntologyLabel) {
+        return candidate;
+      }
+    }
+
+    throw new Error('Ontology frame not found');
+  }
+
+  async function setupL0() {
+    const ontologyFrame = await findOntologyFrame();
+    const ontologyChildren = await ontologyFrame.getChildren();
+    const ontologyShapes = ontologyChildren.filter(item => item.type === 'shape');
+
+    const allShapes = await miro.board.get({ type: 'shape' });
+
+    const missing = [];
     let sourcesBound = 0;
     let referencesBound = 0;
 
-    for (const entity of L0_ENTITIES) {
-      const source =
-        byId.get(entity.source_id) ??
-        await miro.board.getById(entity.source_id);
+    for (const [entityId, canonicalName] of L0_ENTITIES) {
+      const sourceCandidates = ontologyShapes.filter(
+        item => plainText(item.content) === canonicalName
+      );
+
+      if (sourceCandidates.length !== 1) {
+        missing.push(
+          `${canonicalName} (${sourceCandidates.length} candidates in Ontology)`
+        );
+        continue;
+      }
+
+      const source = sourceCandidates[0];
 
       await source.setMetadata(SSOT_KEY, {
-        entity_id: entity.entity_id,
+        entity_id: entityId,
         field: 'name',
         role: 'source'
       });
 
       sourcesBound++;
 
-      for (const item of shapes) {
+      for (const item of allShapes) {
         if (item.id === source.id) continue;
-
-        // Bind existing references by the approved canonical name.
-        // This still works if the source has already been temporarily renamed.
-        if (plainText(item.content) !== entity.canonical_name) continue;
+        if (plainText(item.content) !== canonicalName) continue;
 
         await item.setMetadata(SSOT_KEY, {
-          entity_id: entity.entity_id,
+          entity_id: entityId,
           field: 'name',
           role: 'reference'
         });
 
         referencesBound++;
       }
+    }
+
+    if (missing.length) {
+      throw new Error(
+        `Setup incomplete. Missing/ambiguous canonical items: ${missing.join('; ')}`
+      );
     }
 
     return { sourcesBound, referencesBound };
@@ -116,9 +153,7 @@
     let { sources, references } = await collectBindings();
     let setupResult = null;
 
-    // First run inside the actual SSOT Sync app:
-    // initialize metadata in this app's own metadata namespace.
-    if (sources.size === 0) {
+    if (sources.size < L0_ENTITIES.length) {
       setupResult = await setupL0();
       ({ sources, references } = await collectBindings());
     }
@@ -141,12 +176,18 @@
       }
     }
 
-    let message =
-      `SSOT Sync complete · Sources: ${sources.size} · References: ${references.length} · Updated: ${updated}`;
+    let message;
 
     if (setupResult) {
       message =
-        `SSOT setup complete · Sources: ${setupResult.sourcesBound} · References: ${setupResult.referencesBound} · Updated: ${updated}`;
+        `SSOT setup complete · Sources: ${setupResult.sourcesBound}` +
+        ` · References: ${setupResult.referencesBound}` +
+        ` · Updated: ${updated}`;
+    } else {
+      message =
+        `SSOT Sync complete · Sources: ${sources.size}` +
+        ` · References: ${references.length}` +
+        ` · Updated: ${updated}`;
     }
 
     if (missingSources) {
@@ -162,7 +203,9 @@
         await syncAll();
       } catch (error) {
         console.error('SSOT Sync failed:', error);
-        await miro.board.notifications.showError('SSOT Sync failed');
+        await miro.board.notifications.showError(
+          `SSOT Sync failed: ${error.message ?? 'Unknown error'}`
+        );
       }
     });
   }
