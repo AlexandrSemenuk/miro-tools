@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSOT Sync</title>
+  <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+</head>
+<body>
+<script>
+  const SSOT_KEY = 'portfolio_ssot';
+
+  async function syncAll() {
+    const shapes = await miro.board.get({ type: 'shape' });
+
+    const sources = new Map();
+    const references = [];
+
+    for (const item of shapes) {
+      const meta = await item.getMetadata(SSOT_KEY);
+
+      if (!meta?.entity_id || !meta?.field || !meta?.role) {
+        continue;
+      }
+
+      const key = `${meta.entity_id}:${meta.field}`;
+
+      if (meta.role === 'source') {
+        sources.set(key, item);
+      }
+
+      if (meta.role === 'reference') {
+        references.push({ item, key });
+      }
+    }
+
+    let updated = 0;
+    let missingSources = 0;
+
+    for (const { item, key } of references) {
+      const source = sources.get(key);
+
+      if (!source) {
+        missingSources++;
+        continue;
+      }
+
+      if (item.content !== source.content) {
+        item.content = source.content;
+        await item.sync();
+        updated++;
+      }
+    }
+
+    const message =
+      `SSOT Sync complete · Updated: ${updated}` +
+      (missingSources ? ` · Missing sources: ${missingSources}` : '');
+
+    await miro.board.notifications.showInfo(message);
+  }
+
+  async function init() {
+    await miro.board.ui.on('icon:click', async () => {
+      try {
+        await syncAll();
+      } catch (error) {
+        console.error('SSOT Sync failed:', error);
+        await miro.board.notifications.showError('SSOT Sync failed');
+      }
+    });
+  }
+
+  init();
+</script>
+</body>
+</html>
