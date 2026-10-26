@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSOT Sync v7</title>
+  <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+</head>
+<body>
+<script>
+  const APPDATA_KEY = 'portfolio_ssot_v7';
+  const ONTOLOGY_FRAME_NAME = 'ontology';
+  const UPDATE_BATCH_SIZE = 10;
+
+  let syncInProgress = false;
+
+  function emptyState() {
+    return {
+      v: 7,
+      // source_id -> [reference_id, ...]
+      r: {}
+    };
+  }
+
+  async function loadState() {
+    const raw = await miro.board.getAppData(APPDATA_KEY);
+
+    if (!raw || raw.v !== 7 || typeof raw !== 'object') {
+      return emptyState();
+    }
+
+    const state = emptyState();
+
+    if (raw.r && typeof raw.r === 'object') {
+      for (const [sourceId, refs] of Object.entries(raw.r)) {
+        if (!sourceId || !Array.isArray(refs)) continue;
+        state.r[sourceId] = [...new Set(refs.filter(Boolean))];
+      }
+    }
+
+    return state;
+  }
+
+  async function saveState(state) {
+    await miro.board.setAppData(APPDATA_KEY, state);
+  }
+
+  function buildReferenceIndex(state) {
+    const result = new Map();
+
+    for (const [sourceId, refs] of Object.entries(state.r)) {
+      for (const refId of refs) {
+        result.set(refId, sourceId);
+      }
+    }
+
+    return result;
+  }
+
+  function removeReference(state, referenceId) {
+    for (const sourceId of Object.keys(state.r)) {
+      const next = state.r[sourceId].filter(id => id !== referenceId);
+
+      if (next.length) state.r[sourceId] = next;
+      else delete state.r[sourceId];
+    }
+  }
+
+  function linkReference(state, sourceId, referenceId) {
+    if (!sourceId || !referenceId || sourceId === referenceId) return;
+
+    removeReference(state, referenceId);
+
+    const refs = state.r[sourceId] ?? [];
+    if (!refs.includes(referenceId)) refs.push(referenceId);
+    state.r[sourceId] = refs;
+  }
+
+  async function findOntologyFrame() {
+    const frames = await miro.board.get({ type: 'frame' });
+    const frameList = Array.isArray(frames) ? frames : [frames];
+
+    return frameList.find(
+      frame => (frame.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
+    ) ?? null;
+  }
+
+  function normalizeGetResult(result) {
+    if (!result) return [];
+    return Array.isArray(result) ? result : [result];
+  }
+
+  async function getItemsByIds(ids) {
+    const uniqueIds = [...new Set(ids.filter(Boolean))];
+    if (!uniqueIds.length) return [];
+
+    try {
+      return normalizeGetResult(await miro.board.get({ id: uniqueIds }));
+    } catch (error) {
+      // Fallback only when the registry contains stale/deleted IDs.
+      const settled = await Promise.allSettled(
+        uniqueIds.map(id => miro.board.get({ id }))
+      );
+
+      const items = [];
+      for (const result of settled) {
+        if (result.status !== 'fulfilled') continue;
+        items.push(...normalizeGetResult(result.value));
+      }
+      return items;
+    }
+  }
+
+  async function runInBatches(tasks, batchSize = UPDATE_BATCH_SIZE) {
+    for (let i = 0; i < tasks.length; i += batchSize) {
+      const batch = tasks.slice(i, i + batchSize);
+      await Promise.all(batch.map(task => task()));
+    }
+  }
+
+  async function syncRegistry(state) {
+    const sourceIds = Object.keys(state.r);
+    const referenceIds = sourceIds.flatMap(sourceId => state.r[sourceId]);
+    const items = await getItemsByIds([...sourceIds, ...referenceIds]);
+    const byId = new Map(items.map(item => [item.id, item]));
+
+    let updated = 0;
+    let missingSources = 0;
+    let missingReferences = 0;
+    let registryChanged = false;
+    const updateTasks = [];
+
+    for (const sourceId of sourceIds) {
+      const source = byId.get(sourceId);
+      const refs = state.r[sourceId] ?? [];
+
+      if (!source) {
+        missingSources++;
+        continue;
+      }
+
+      const survivingRefs = [];
+
+      for (const referenceId of refs) {
+        const reference = byId.get(referenceId);
+
+        if (!reference) {
+          missingReferences++;
+          registryChanged = true;
+          continue;
+        }
+
+        survivingRefs.push(referenceId);
+
+        if (reference.content !== source.content) {
+          updateTasks.push(async () => {
+            reference.content = source.content;
+            await reference.sync();
+            updated++;
+          });
+        }
+      }
+
+      if (survivingRefs.length !== refs.length) {
+        if (survivingRefs.length) state.r[sourceId] = survivingRefs;
+        else delete state.r[sourceId];
+      }
+    }
+
+    await runInBatches(updateTasks);
+
+    if (registryChanged) {
+      await saveState(state);
+    }
+
+    return {
+      updated,
+      sources: Object.keys(state.r).length,
+      references: Object.values(state.r).reduce((sum, refs) => sum + refs.length, 0),
+      missingSources,
+      missingReferences
+    };
+  }
+
+  async function pairSelected(state, selection) {
+    if (selection.length !== 2) {
+      throw new Error('Pair mode requires exactly 2 selected shapes.');
+    }
+
+    const [a, b] = selection;
+
+    if (a.type !== 'shape' || b.type !== 'shape') {
+      throw new Error('Select exactly 2 shapes.');
+    }
+
+    const ontologyFrame = await findOntologyFrame();
+    if (!ontologyFrame) {
+      throw new Error('Ontology frame not found.');
+    }
+
+    const aCanonical = a.parentId === ontologyFrame.id;
+    const bCanonical = b.parentId === ontologyFrame.id;
+
+    if (aCanonical && bCanonical) {
+      throw new Error('Two Ontology sources cannot be linked to each other.');
+    }
+
+    const referenceIndex = buildReferenceIndex(state);
+    const aSource = aCanonical ? a.id : referenceIndex.get(a.id) ?? null;
+    const bSource = bCanonical ? b.id : referenceIndex.get(b.id) ?? null;
+
+    let sourceId = null;
+    let targetId = null;
+    let rebound = false;
+
+    if (aCanonical || bCanonical) {
+      const canonical = aCanonical ? a : b;
+      const target = aCanonical ? b : a;
+      const previousSource = referenceIndex.get(target.id) ?? null;
+
+      sourceId = canonical.id;
+      targetId = target.id;
+      rebound = Boolean(previousSource && previousSource !== sourceId);
+    } else if (aSource && bSource) {
+      if (aSource !== bSource) {
+        throw new Error('Selected references belong to different Ontology sources.');
+      }
+
+      sourceId = aSource;
+      // Both are already linked to the same source: nothing new to register.
+    } else if (aSource || bSource) {
+      sourceId = aSource || bSource;
+      targetId = aSource ? b.id : a.id;
+    } else {
+      throw new Error(
+        'Cannot determine the source. Select an Ontology source + copy, or an already linked reference + new copy.'
+      );
+    }
+
+    if (targetId) {
+      linkReference(state, sourceId, targetId);
+      await saveState(state);
+    }
+
+    return {
+      sourceId,
+      linked: targetId ? 1 : 0,
+      rebound
+    };
+  }
+
+  async function handleSync() {
+    if (syncInProgress) {
+      await miro.board.notifications.showInfo('SSOT Sync is already running.');
+      return;
+    }
+
+    syncInProgress = true;
+
+    try {
+      const selection = await miro.board.getSelection();
+      const selectedShapes = selection.filter(item => item.type === 'shape');
+
+      if (selection.length === 0) {
+        const state = await loadState();
+        const result = await syncRegistry(state);
+
+        let message =
+          `SSOT Sync · Sources: ${result.sources}` +
+          ` · References: ${result.references}` +
+          ` · Updated: ${result.updated}`;
+
+        if (result.missingSources) {
+          message += ` · Missing sources: ${result.missingSources}`;
+        }
+        if (result.missingReferences) {
+          message += ` · Removed missing refs: ${result.missingReferences}`;
+        }
+
+        await miro.board.notifications.showInfo(message);
+        return;
+      }
+
+      if (selection.length !== 2 || selectedShapes.length !== 2) {
+        await miro.board.notifications.showError(
+          'Select exactly 2 shapes to link them, or deselect everything to sync all existing links.'
+        );
+        return;
+      }
+
+      const state = await loadState();
+      const pairResult = await pairSelected(state, selectedShapes);
+      const syncResult = await syncRegistry(state);
+
+      let message =
+        `SSOT Pair · Linked: ${pairResult.linked}` +
+        ` · Sources: ${syncResult.sources}` +
+        ` · References: ${syncResult.references}` +
+        ` · Updated: ${syncResult.updated}`;
+
+      if (pairResult.rebound) message += ' · Rebound: 1';
+      if (syncResult.missingSources) {
+        message += ` · Missing sources: ${syncResult.missingSources}`;
+      }
+      if (syncResult.missingReferences) {
+        message += ` · Removed missing refs: ${syncResult.missingReferences}`;
+      }
+
+      await miro.board.notifications.showInfo(message);
+    } catch (error) {
+      console.error('SSOT Sync v7 failed:', error);
+      await miro.board.notifications.showError(
+        `SSOT Sync failed: ${error.message ?? 'Unknown error'}`
+      );
+    } finally {
+      syncInProgress = false;
+    }
+  }
+
+  async function init() {
+    await miro.board.ui.on('icon:click', handleSync);
+  }
+
+  init();
+</script>
+</body>
+</html>
