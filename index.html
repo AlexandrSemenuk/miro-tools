@@ -11,6 +11,7 @@
   const SSOT_KEY = 'portfolio_ssot';
   const ONTOLOGY_FRAME_NAME = 'ontology';
   const IGNORE_PREFIX = '_';
+  const MAX_ALIASES = 50;
 
   function plainText(content) {
     const div = document.createElement('div');
@@ -24,8 +25,27 @@
   }
 
   function createEntityId(source) {
-    // Canonical Miro item id is stable across renames, so it is the safest seed.
     return `ssot_${source.id}`;
+  }
+
+  function normalizeAliases(rawAliases, currentText, previousText) {
+    const aliases = Array.isArray(rawAliases) ? rawAliases.filter(Boolean) : [];
+
+    if (previousText && previousText !== currentText) {
+      aliases.push(previousText);
+    }
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const value of aliases) {
+      const text = String(value).replace(/\s+/g, ' ').trim();
+      if (!text || text === currentText || seen.has(text)) continue;
+      seen.add(text);
+      unique.push(text);
+    }
+
+    return unique.slice(-MAX_ALIASES);
   }
 
   async function findOntologyFrame() {
@@ -50,9 +70,12 @@
 
   async function registerSources(ontologyShapes) {
     const byEntityId = new Map();
+    const byLegacyEntityId = new Map();
     const byItemId = new Map();
     let registered = 0;
     let ignored = 0;
+    let renamedSources = 0;
+    let clonedSourcesReset = 0;
 
     for (const source of ontologyShapes) {
       if (isIgnored(source)) {
@@ -60,47 +83,93 @@
         continue;
       }
 
+      const currentText = plainText(source.content);
       const currentMeta = await source.getMetadata(SSOT_KEY);
-      const entityId = currentMeta?.entity_id || createEntityId(source);
+      const entityId = createEntityId(source);
 
-      // Canonical source metadata is reaffirmed every run, but the id is never
-      // changed just because the visible text changes.
+      // If a canonical source was created by copying another canonical source,
+      // Miro may also copy app metadata. Do not inherit the original source's
+      // identity or rename history.
+      const isClonedSource =
+        currentMeta?.source_item_id && currentMeta.source_item_id !== source.id;
+
+      if (isClonedSource) clonedSourcesReset++;
+
+      const previousText = isClonedSource ? null : currentMeta?.last_text;
+      const previousAliases = isClonedSource ? [] : currentMeta?.aliases;
+      const aliases = normalizeAliases(
+        previousAliases,
+        currentText,
+        previousText
+      );
+
+      if (previousText && previousText !== currentText) {
+        renamedSources++;
+      }
+
+      const sourceEntry = {
+        item: source,
+        entityId,
+        currentText,
+        aliases
+      };
+
+      // Migration path for older v3/v4 references that only know the old
+      // entity_id. Do not register copied foreign source metadata as legacy.
+      if (currentMeta?.entity_id && !isClonedSource) {
+        byLegacyEntityId.set(currentMeta.entity_id, sourceEntry);
+      }
+
       await source.setMetadata(SSOT_KEY, {
         entity_id: entityId,
         source_item_id: source.id,
         field: 'content',
-        role: 'source'
+        role: 'source',
+        last_text: currentText,
+        aliases
       });
 
-      byEntityId.set(entityId, source);
-      byItemId.set(source.id, source);
+      byEntityId.set(entityId, sourceEntry);
+      byItemId.set(source.id, sourceEntry);
       registered++;
     }
 
-    return { byEntityId, byItemId, registered, ignored };
+    return {
+      byEntityId,
+      byLegacyEntityId,
+      byItemId,
+      registered,
+      ignored,
+      renamedSources,
+      clonedSourcesReset
+    };
   }
 
-  function buildSourcesByText(byItemId) {
+  function buildSourcesByKnownText(sourceRegistry) {
     const result = new Map();
 
-    for (const source of byItemId.values()) {
-      const text = plainText(source.content);
-      if (!text) continue;
-
+    function add(text, sourceEntry) {
+      if (!text) return;
       const list = result.get(text) ?? [];
-      list.push(source);
+      list.push(sourceEntry);
       result.set(text, list);
+    }
+
+    for (const sourceEntry of sourceRegistry.byItemId.values()) {
+      add(sourceEntry.currentText, sourceEntry);
+      for (const alias of sourceEntry.aliases) add(alias, sourceEntry);
     }
 
     return result;
   }
 
   async function discoverReferences(allShapes, ontologyShapeIds, sourceRegistry) {
-    const sourcesByText = buildSourcesByText(sourceRegistry.byItemId);
+    const sourcesByKnownText = buildSourcesByKnownText(sourceRegistry);
     const links = [];
 
     let newLinks = 0;
     let repairedLinks = 0;
+    let recoveredByAlias = 0;
     let ambiguous = 0;
     let orphans = 0;
 
@@ -109,24 +178,32 @@
       if (isIgnored(item)) continue;
 
       const meta = await item.getMetadata(SSOT_KEY);
-      let source = null;
+      let sourceEntry = null;
+      let matchedByText = false;
 
-      // 1) Strongest relationship: direct canonical item id.
       if (meta?.source_item_id) {
-        source = sourceRegistry.byItemId.get(meta.source_item_id) ?? null;
+        sourceEntry = sourceRegistry.byItemId.get(meta.source_item_id) ?? null;
       }
 
-      // 2) Backward compatibility with v3/v4 entity_id-only metadata.
-      if (!source && meta?.entity_id) {
-        source = sourceRegistry.byEntityId.get(meta.entity_id) ?? null;
+      if (!sourceEntry && meta?.entity_id) {
+        sourceEntry =
+          sourceRegistry.byEntityId.get(meta.entity_id) ??
+          sourceRegistry.byLegacyEntityId.get(meta.entity_id) ??
+          null;
       }
 
-      // 3) Discovery is text-based ONLY for an unbound/broken reference.
-      if (!source) {
-        const candidates = sourcesByText.get(plainText(item.content)) ?? [];
+      // Recovery/discovery path. Uses both current canonical name and aliases.
+      if (!sourceEntry) {
+        const text = plainText(item.content);
+        const candidates = sourcesByKnownText.get(text) ?? [];
 
         if (candidates.length === 1) {
-          source = candidates[0];
+          sourceEntry = candidates[0];
+          matchedByText = true;
+
+          const isHistoricalName = text !== sourceEntry.currentText;
+          if (isHistoricalName) recoveredByAlias++;
+
           if (meta?.entity_id || meta?.source_item_id) repairedLinks++;
           else newLinks++;
         } else if (candidates.length > 1) {
@@ -138,27 +215,32 @@
         }
       }
 
-      const sourceMeta = await source.getMetadata(SSOT_KEY);
-      const entityId = sourceMeta?.entity_id || createEntityId(source);
-
-      // Reaffirm reference metadata every run. Visible text never decides an
-      // already-bound relationship after this point.
       await item.setMetadata(SSOT_KEY, {
-        entity_id: entityId,
-        source_item_id: source.id,
+        entity_id: sourceEntry.entityId,
+        source_item_id: sourceEntry.item.id,
         field: 'content',
         role: 'reference'
       });
 
-      links.push({ referenceId: item.id, sourceId: source.id, entityId });
+      links.push({
+        referenceId: item.id,
+        sourceId: sourceEntry.item.id,
+        entityId: sourceEntry.entityId,
+        matchedByText
+      });
     }
 
-    return { links, newLinks, repairedLinks, ambiguous, orphans };
+    return {
+      links,
+      newLinks,
+      repairedLinks,
+      recoveredByAlias,
+      ambiguous,
+      orphans
+    };
   }
 
   async function syncBoundReferences(links) {
-    // Re-read shapes after all metadata writes so synchronization works with
-    // fresh board objects rather than stale instances from discovery.
     const freshShapes = await miro.board.get({ type: 'shape' });
     const byId = new Map(freshShapes.map(item => [item.id, item]));
 
@@ -180,7 +262,6 @@
         updated++;
       }
 
-      // Defensive: keep the relationship explicitly persisted after sync().
       await reference.setMetadata(SSOT_KEY, {
         entity_id: link.entityId,
         source_item_id: link.sourceId,
@@ -215,8 +296,14 @@
       ` · New links: ${referenceResult.newLinks}` +
       ` · Updated: ${syncResult.updated}`;
 
+    if (referenceResult.recoveredByAlias) {
+      message += ` · Recovered: ${referenceResult.recoveredByAlias}`;
+    }
     if (referenceResult.repairedLinks) {
       message += ` · Repaired: ${referenceResult.repairedLinks}`;
+    }
+    if (sourceRegistry.clonedSourcesReset) {
+      message += ` · Source clones reset: ${sourceRegistry.clonedSourcesReset}`;
     }
     if (sourceRegistry.ignored) {
       message += ` · Ignored _: ${sourceRegistry.ignored}`;
