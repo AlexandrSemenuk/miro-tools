@@ -18,198 +18,178 @@
     return (div.textContent ?? '').replace(/\s+/g, ' ').trim();
   }
 
-  function isEmpty(item) {
-    return plainText(item.content).length === 0;
+  function isIgnored(item) {
+    const text = plainText(item.content);
+    return !text || text.startsWith(IGNORE_PREFIX);
   }
 
-  function hasIgnorePrefix(item) {
-    return plainText(item.content).startsWith(IGNORE_PREFIX);
-  }
-
-  function createEntityId() {
-    if (globalThis.crypto?.randomUUID) {
-      return `ssot_${globalThis.crypto.randomUUID()}`;
-    }
-
-    return `ssot_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  function createEntityId(source) {
+    // Canonical Miro item id is stable across renames, so it is the safest seed.
+    return `ssot_${source.id}`;
   }
 
   async function findOntologyFrame() {
     const frames = await miro.board.get({ type: 'frame' });
 
-    let frame = frames.find(
+    const exact = frames.find(
       item => (item.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
     );
+    if (exact) return exact;
 
-    if (frame) return frame;
-
-    // Fallback: find a frame containing a child labelled "Ontology".
-    for (const candidate of frames) {
-      const children = await candidate.getChildren();
-
-      const hasOntologyLabel = children.some(item => {
+    for (const frame of frames) {
+      const children = await frame.getChildren();
+      const hasLabel = children.some(item => {
         if (item.type !== 'shape' && item.type !== 'text') return false;
         return plainText(item.content).toLowerCase() === ONTOLOGY_FRAME_NAME;
       });
-
-      if (hasOntologyLabel) return candidate;
+      if (hasLabel) return frame;
     }
 
     throw new Error('Ontology frame not found');
   }
 
-  async function normalizeSources(ontologyShapes) {
-    const sources = new Map();
-    const sourceIdsInUse = new Set();
-    let newSources = 0;
-    let repairedSources = 0;
-    let ignoredSources = 0;
+  async function registerSources(ontologyShapes) {
+    const byEntityId = new Map();
+    const byItemId = new Map();
+    let registered = 0;
+    let ignored = 0;
 
     for (const source of ontologyShapes) {
-      if (isEmpty(source)) continue;
-
-      if (hasIgnorePrefix(source)) {
-        ignoredSources++;
+      if (isIgnored(source)) {
+        ignored++;
         continue;
       }
 
       const currentMeta = await source.getMetadata(SSOT_KEY);
-      let entityId = currentMeta?.entity_id;
+      const entityId = currentMeta?.entity_id || createEntityId(source);
 
-      // A copied canonical shape may carry the original source metadata.
-      // Every canonical shape inside Ontology must own a unique entity_id.
-      if (!entityId || sourceIdsInUse.has(entityId)) {
-        entityId = createEntityId();
-        newSources++;
-      }
+      // Canonical source metadata is reaffirmed every run, but the id is never
+      // changed just because the visible text changes.
+      await source.setMetadata(SSOT_KEY, {
+        entity_id: entityId,
+        source_item_id: source.id,
+        field: 'content',
+        role: 'source'
+      });
 
-      sourceIdsInUse.add(entityId);
-
-      const needsRepair =
-        currentMeta?.entity_id !== entityId ||
-        currentMeta?.role !== 'source' ||
-        currentMeta?.field !== 'content';
-
-      if (needsRepair) {
-        await source.setMetadata(SSOT_KEY, {
-          entity_id: entityId,
-          field: 'content',
-          role: 'source'
-        });
-
-        if (currentMeta?.entity_id) repairedSources++;
-      }
-
-      sources.set(entityId, source);
+      byEntityId.set(entityId, source);
+      byItemId.set(source.id, source);
+      registered++;
     }
 
-    return {
-      sources,
-      newSources,
-      repairedSources,
-      ignoredSources
-    };
+    return { byEntityId, byItemId, registered, ignored };
   }
 
-  function buildSourcesByText(sources) {
-    const byText = new Map();
+  function buildSourcesByText(byItemId) {
+    const result = new Map();
 
-    for (const [entityId, source] of sources) {
+    for (const source of byItemId.values()) {
       const text = plainText(source.content);
       if (!text) continue;
 
-      const entries = byText.get(text) ?? [];
-      entries.push({ entityId, source });
-      byText.set(text, entries);
+      const list = result.get(text) ?? [];
+      list.push(source);
+      result.set(text, list);
     }
 
-    return byText;
+    return result;
   }
 
-  async function bindReferences(allShapes, ontologyShapeIds, sources) {
-    const sourcesByText = buildSourcesByText(sources);
-    const references = [];
+  async function discoverReferences(allShapes, ontologyShapeIds, sourceRegistry) {
+    const sourcesByText = buildSourcesByText(sourceRegistry.byItemId);
+    const links = [];
 
-    let newReferences = 0;
-    let repairedReferences = 0;
-    let ambiguousReferences = 0;
-    let orphanReferences = 0;
+    let newLinks = 0;
+    let repairedLinks = 0;
+    let ambiguous = 0;
+    let orphans = 0;
 
     for (const item of allShapes) {
       if (ontologyShapeIds.has(item.id)) continue;
-      if (isEmpty(item) || hasIgnorePrefix(item)) continue;
+      if (isIgnored(item)) continue;
 
       const meta = await item.getMetadata(SSOT_KEY);
+      let source = null;
 
-      // Existing links always win over text matching. This keeps references
-      // connected even after either side has been renamed.
-      if (meta?.entity_id) {
-        if (sources.has(meta.entity_id)) {
-          const needsRepair =
-            meta.role !== 'reference' || meta.field !== 'content';
+      // 1) Strongest relationship: direct canonical item id.
+      if (meta?.source_item_id) {
+        source = sourceRegistry.byItemId.get(meta.source_item_id) ?? null;
+      }
 
-          if (needsRepair) {
-            await item.setMetadata(SSOT_KEY, {
-              entity_id: meta.entity_id,
-              field: 'content',
-              role: 'reference'
-            });
-            repairedReferences++;
-          }
+      // 2) Backward compatibility with v3/v4 entity_id-only metadata.
+      if (!source && meta?.entity_id) {
+        source = sourceRegistry.byEntityId.get(meta.entity_id) ?? null;
+      }
 
-          references.push({ item, entityId: meta.entity_id });
+      // 3) Discovery is text-based ONLY for an unbound/broken reference.
+      if (!source) {
+        const candidates = sourcesByText.get(plainText(item.content)) ?? [];
+
+        if (candidates.length === 1) {
+          source = candidates[0];
+          if (meta?.entity_id || meta?.source_item_id) repairedLinks++;
+          else newLinks++;
+        } else if (candidates.length > 1) {
+          ambiguous++;
+          continue;
         } else {
-          orphanReferences++;
+          if (meta?.entity_id || meta?.source_item_id) orphans++;
+          continue;
         }
+      }
 
+      const sourceMeta = await source.getMetadata(SSOT_KEY);
+      const entityId = sourceMeta?.entity_id || createEntityId(source);
+
+      // Reaffirm reference metadata every run. Visible text never decides an
+      // already-bound relationship after this point.
+      await item.setMetadata(SSOT_KEY, {
+        entity_id: entityId,
+        source_item_id: source.id,
+        field: 'content',
+        role: 'reference'
+      });
+
+      links.push({ referenceId: item.id, sourceId: source.id, entityId });
+    }
+
+    return { links, newLinks, repairedLinks, ambiguous, orphans };
+  }
+
+  async function syncBoundReferences(links) {
+    // Re-read shapes after all metadata writes so synchronization works with
+    // fresh board objects rather than stale instances from discovery.
+    const freshShapes = await miro.board.get({ type: 'shape' });
+    const byId = new Map(freshShapes.map(item => [item.id, item]));
+
+    let updated = 0;
+    let missing = 0;
+
+    for (const link of links) {
+      const reference = byId.get(link.referenceId);
+      const source = byId.get(link.sourceId);
+
+      if (!reference || !source) {
+        missing++;
         continue;
       }
 
-      const text = plainText(item.content);
-      if (!text) continue;
-
-      const candidates = sourcesByText.get(text) ?? [];
-
-      if (candidates.length === 1) {
-        const entityId = candidates[0].entityId;
-
-        await item.setMetadata(SSOT_KEY, {
-          entity_id: entityId,
-          field: 'content',
-          role: 'reference'
-        });
-
-        references.push({ item, entityId });
-        newReferences++;
-      } else if (candidates.length > 1) {
-        ambiguousReferences++;
-      }
-    }
-
-    return {
-      references,
-      newReferences,
-      repairedReferences,
-      ambiguousReferences,
-      orphanReferences
-    };
-  }
-
-  async function syncReferences(references, sources) {
-    let updated = 0;
-
-    for (const { item, entityId } of references) {
-      const source = sources.get(entityId);
-      if (!source) continue;
-
-      if (item.content !== source.content) {
-        item.content = source.content;
-        await item.sync();
+      if (reference.content !== source.content) {
+        reference.content = source.content;
+        await reference.sync();
         updated++;
       }
+
+      // Defensive: keep the relationship explicitly persisted after sync().
+      await reference.setMetadata(SSOT_KEY, {
+        entity_id: link.entityId,
+        source_item_id: link.sourceId,
+        field: 'content',
+        role: 'reference'
+      });
     }
 
-    return updated;
+    return { updated, missing };
   }
 
   async function syncAll() {
@@ -218,36 +198,37 @@
     const ontologyShapes = ontologyChildren.filter(item => item.type === 'shape');
     const ontologyShapeIds = new Set(ontologyShapes.map(item => item.id));
 
+    const sourceRegistry = await registerSources(ontologyShapes);
     const allShapes = await miro.board.get({ type: 'shape' });
 
-    const sourceResult = await normalizeSources(ontologyShapes);
-    const referenceResult = await bindReferences(
+    const referenceResult = await discoverReferences(
       allShapes,
       ontologyShapeIds,
-      sourceResult.sources
+      sourceRegistry
     );
 
-    const updated = await syncReferences(
-      referenceResult.references,
-      sourceResult.sources
-    );
+    const syncResult = await syncBoundReferences(referenceResult.links);
 
     let message =
-      `SSOT Sync complete · Sources: ${sourceResult.sources.size}` +
-      ` · References: ${referenceResult.references.length}` +
-      ` · New links: ${referenceResult.newReferences}` +
-      ` · Updated: ${updated}`;
+      `SSOT Sync · Sources: ${sourceRegistry.registered}` +
+      ` · References: ${referenceResult.links.length}` +
+      ` · New links: ${referenceResult.newLinks}` +
+      ` · Updated: ${syncResult.updated}`;
 
-    if (sourceResult.ignoredSources) {
-      message += ` · Ignored _: ${sourceResult.ignoredSources}`;
+    if (referenceResult.repairedLinks) {
+      message += ` · Repaired: ${referenceResult.repairedLinks}`;
     }
-
-    if (referenceResult.ambiguousReferences) {
-      message += ` · Ambiguous: ${referenceResult.ambiguousReferences}`;
+    if (sourceRegistry.ignored) {
+      message += ` · Ignored _: ${sourceRegistry.ignored}`;
     }
-
-    if (referenceResult.orphanReferences) {
-      message += ` · Orphans: ${referenceResult.orphanReferences}`;
+    if (referenceResult.ambiguous) {
+      message += ` · Ambiguous: ${referenceResult.ambiguous}`;
+    }
+    if (referenceResult.orphans) {
+      message += ` · Orphans: ${referenceResult.orphans}`;
+    }
+    if (syncResult.missing) {
+      message += ` · Missing items: ${syncResult.missing}`;
     }
 
     await miro.board.notifications.showInfo(message);
