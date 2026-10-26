@@ -8,16 +8,13 @@
 </head>
 <body>
 <script>
-  const APPDATA_KEY = 'portfolio_ssot_v6';
-  const LEGACY_METADATA_KEY = 'portfolio_ssot';
-
+  const APPDATA_KEY = 'portfolio_ssot_v61';
   const ONTOLOGY_FRAME_NAME = 'ontology';
   const DECOMPOSITION_MARKER = 'decomposition';
   const IGNORE_PREFIX = '_';
-
   const MAX_ALIASES = 50;
   const APPDATA_SOFT_LIMIT_BYTES = 28000;
-  const UPDATE_BATCH_SIZE = 12;
+  const UPDATE_BATCH_SIZE = 20;
 
   let syncInProgress = false;
   let rerunRequested = false;
@@ -28,44 +25,35 @@
     return (div.textContent ?? '').replace(/\s+/g, ' ').trim();
   }
 
-  function isIgnored(item) {
+  function ignored(item) {
     const text = plainText(item.content);
     return !text || text.startsWith(IGNORE_PREFIX);
   }
 
+  function emptyState() {
+    return { v: 61, s: {}, r: {} };
+  }
+
   function normalizeAliases(values, currentText) {
-    const result = [];
+    const out = [];
     const seen = new Set();
 
     for (const raw of values ?? []) {
       const text = String(raw ?? '').replace(/\s+/g, ' ').trim();
       if (!text || text === currentText || seen.has(text)) continue;
       seen.add(text);
-      result.push(text);
+      out.push(text);
     }
 
-    return result.slice(-MAX_ALIASES);
-  }
-
-  function emptyState() {
-    return {
-      v: 6,
-      // source_id -> { t: last canonical text, a: aliases[] }
-      s: {},
-      // source_id -> [reference_id, ...]
-      r: {}
-    };
+    return out.slice(-MAX_ALIASES);
   }
 
   async function loadState() {
     const raw = await miro.board.getAppData(APPDATA_KEY);
-
-    if (!raw || raw.v !== 6 || typeof raw !== 'object') {
-      return emptyState();
-    }
+    if (!raw || raw.v !== 61 || typeof raw !== 'object') return emptyState();
 
     return {
-      v: 6,
+      v: 61,
       s: raw.s && typeof raw.s === 'object' ? raw.s : {},
       r: raw.r && typeof raw.r === 'object' ? raw.r : {}
     };
@@ -73,105 +61,60 @@
 
   async function saveState(state) {
     const bytes = new TextEncoder().encode(JSON.stringify(state)).length;
-
     if (bytes > APPDATA_SOFT_LIMIT_BYTES) {
-      throw new Error(
-        `SSOT state is too large (${bytes} bytes). AppData soft limit is ${APPDATA_SOFT_LIMIT_BYTES}.`
-      );
+      throw new Error(`SSOT state is too large: ${bytes} bytes`);
     }
-
     await miro.board.setAppData(APPDATA_KEY, state);
     return bytes;
   }
 
-  async function getFrameStructure() {
+  async function getFrames() {
     const frames = await miro.board.get({ type: 'frame' });
 
-    const ontologyFrame = frames.find(
-      frame => (frame.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
+    const ontology = frames.find(
+      f => (f.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
+    );
+    if (!ontology) throw new Error('Ontology frame not found');
+
+    const decomposition = frames.filter(f =>
+      f.id !== ontology.id &&
+      (f.title ?? '').toLowerCase().includes(DECOMPOSITION_MARKER)
     );
 
-    if (!ontologyFrame) {
-      throw new Error('Ontology frame not found');
-    }
-
-    const decompositionFrames = frames.filter(frame => {
-      if (frame.id === ontologyFrame.id) return false;
-      return (frame.title ?? '').toLowerCase().includes(DECOMPOSITION_MARKER);
-    });
-
-    if (!decompositionFrames.length) {
+    if (!decomposition.length) {
       throw new Error('No frames with "Decomposition" in the title were found');
     }
 
-    return { ontologyFrame, decompositionFrames };
+    return { ontology, decomposition };
   }
 
-  async function collectShapesRecursively(rootFrames) {
+  async function collectShapes(rootFrames) {
     const shapes = new Map();
-    const visitedFrames = new Set();
     const queue = [...rootFrames];
+    const visited = new Set();
 
     while (queue.length) {
       const frame = queue.shift();
-      if (!frame || visitedFrames.has(frame.id)) continue;
-      visitedFrames.add(frame.id);
+      if (!frame || visited.has(frame.id)) continue;
+      visited.add(frame.id);
 
       const children = await frame.getChildren();
-
       for (const child of children) {
-        if (child.type === 'shape') {
-          shapes.set(child.id, child);
-        } else if (child.type === 'frame') {
-          queue.push(child);
-        }
+        if (child.type === 'shape') shapes.set(child.id, child);
+        else if (child.type === 'frame') queue.push(child);
       }
     }
 
-    return {
-      shapes,
-      frameCount: visitedFrames.size
-    };
+    return shapes;
   }
 
-  async function seedSourceFromLegacyMetadata(source, currentText) {
-    try {
-      const legacy = await source.getMetadata(LEGACY_METADATA_KEY);
-
-      // Only import history that really belongs to this canonical item.
-      // Copies of another source may inherit foreign metadata; ignore it.
-      if (!legacy || legacy.source_item_id !== source.id) {
-        return { t: currentText, a: [] };
-      }
-
-      const aliases = [];
-
-      if (Array.isArray(legacy.aliases)) {
-        aliases.push(...legacy.aliases);
-      }
-
-      if (legacy.last_text && legacy.last_text !== currentText) {
-        aliases.push(legacy.last_text);
-      }
-
-      return {
-        t: currentText,
-        a: normalizeAliases(aliases, currentText)
-      };
-    } catch (_) {
-      return { t: currentText, a: [] };
-    }
-  }
-
-  async function buildSourceRegistry(ontologyShapes, state) {
-    const ontologyIds = new Set(ontologyShapes.keys());
+  function registerSources(ontologyShapes, state) {
     const active = new Map();
-
-    let ignoredSources = 0;
-    let renamedSources = 0;
+    const ontologyIds = new Set(ontologyShapes.keys());
+    let renamed = 0;
     let newSources = 0;
+    let ignoredSources = 0;
 
-    // Remove sources that no longer exist in Ontology.
     for (const sourceId of Object.keys(state.s)) {
       if (!ontologyIds.has(sourceId)) {
         delete state.s[sourceId];
@@ -181,56 +124,39 @@
 
     for (const source of ontologyShapes.values()) {
       const currentText = plainText(source.content);
-
-      // Keep existing state for ignored sources so links can resume if the
-      // underscore is later removed, but do not make them active.
       if (!currentText || currentText.startsWith(IGNORE_PREFIX)) {
         ignoredSources++;
         continue;
       }
 
-      let sourceState = state.s[source.id];
+      const existing = state.s[source.id];
+      const aliases = Array.isArray(existing?.a) ? [...existing.a] : [];
+      const previousText = String(existing?.t ?? '').trim();
 
-      if (!sourceState) {
-        sourceState = await seedSourceFromLegacyMetadata(source, currentText);
-        state.s[source.id] = sourceState;
+      if (!existing) {
         newSources++;
-      } else {
-        const previousText = String(sourceState.t ?? '').trim();
-        const aliases = Array.isArray(sourceState.a) ? [...sourceState.a] : [];
-
-        if (previousText && previousText !== currentText) {
-          aliases.push(previousText);
-          renamedSources++;
-        }
-
-        sourceState = {
-          t: currentText,
-          a: normalizeAliases(aliases, currentText)
-        };
-        state.s[source.id] = sourceState;
+      } else if (previousText && previousText !== currentText) {
+        aliases.push(previousText);
+        renamed++;
       }
 
-      if (!state.r[source.id]) {
-        state.r[source.id] = [];
-      }
+      state.s[source.id] = {
+        t: currentText,
+        a: normalizeAliases(aliases, currentText)
+      };
+      state.r[source.id] = Array.isArray(state.r[source.id]) ? state.r[source.id] : [];
 
       active.set(source.id, {
         item: source,
         currentText,
-        aliases: state.s[source.id].a ?? []
+        aliases: state.s[source.id].a
       });
     }
 
-    return {
-      active,
-      ignoredSources,
-      renamedSources,
-      newSources
-    };
+    return { active, renamed, newSources, ignoredSources };
   }
 
-  function buildKnownTextIndex(activeSources) {
+  function buildTextIndex(activeSources) {
     const index = new Map();
 
     function add(text, sourceId) {
@@ -240,26 +166,23 @@
       index.set(text, set);
     }
 
-    for (const [sourceId, source] of activeSources) {
-      add(source.currentText, sourceId);
-      for (const alias of source.aliases) {
-        add(alias, sourceId);
-      }
+    for (const [sourceId, src] of activeSources) {
+      add(src.currentText, sourceId);
+      for (const alias of src.aliases) add(alias, sourceId);
     }
 
     return index;
   }
 
-  function sanitizeStoredLinks(state, scopedShapes) {
-    const activeScopedIds = new Set();
+  function sanitizeLinks(state, scopedShapes) {
+    const activeRefIds = new Set();
+    const refToSource = new Map();
+    let pruned = 0;
+    let duplicates = 0;
 
     for (const item of scopedShapes.values()) {
-      if (!isIgnored(item)) activeScopedIds.add(item.id);
+      if (!ignored(item)) activeRefIds.add(item.id);
     }
-
-    const refToSource = new Map();
-    let prunedLinks = 0;
-    let duplicateLinks = 0;
 
     for (const [sourceId, refsRaw] of Object.entries(state.r)) {
       if (!state.s[sourceId]) {
@@ -267,171 +190,128 @@
         continue;
       }
 
-      const refs = Array.isArray(refsRaw) ? refsRaw : [];
       const kept = [];
-
-      for (const refId of refs) {
-        if (!activeScopedIds.has(refId)) {
-          prunedLinks++;
+      for (const refId of Array.isArray(refsRaw) ? refsRaw : []) {
+        if (!activeRefIds.has(refId)) {
+          pruned++;
           continue;
         }
-
         if (refToSource.has(refId)) {
-          duplicateLinks++;
+          duplicates++;
           continue;
         }
 
         refToSource.set(refId, sourceId);
         kept.push(refId);
       }
-
       state.r[sourceId] = kept;
     }
 
-    return {
-      refToSource,
-      activeScopedIds,
-      prunedLinks,
-      duplicateLinks
-    };
+    return { refToSource, pruned, duplicates };
   }
 
-  function discoverNewLinks(scopedShapes, activeSources, state, refToSource) {
-    const knownText = buildKnownTextIndex(activeSources);
-
+  function discoverLinks(scopedShapes, activeSources, state, refToSource) {
+    const textIndex = buildTextIndex(activeSources);
     let newLinks = 0;
     let ambiguous = 0;
-    let unmatched = 0;
 
     for (const item of scopedShapes.values()) {
-      if (isIgnored(item)) continue;
-      if (refToSource.has(item.id)) continue;
+      if (ignored(item) || refToSource.has(item.id)) continue;
 
-      const text = plainText(item.content);
-      const candidates = [...(knownText.get(text) ?? [])];
-
+      const candidates = [...(textIndex.get(plainText(item.content)) ?? [])];
       if (candidates.length === 1) {
         const sourceId = candidates[0];
-        state.r[sourceId] = state.r[sourceId] ?? [];
         state.r[sourceId].push(item.id);
         refToSource.set(item.id, sourceId);
         newLinks++;
       } else if (candidates.length > 1) {
         ambiguous++;
-      } else {
-        unmatched++;
       }
     }
 
-    return { newLinks, ambiguous, unmatched };
+    return { newLinks, ambiguous };
   }
 
   function buildUpdates(scopedShapes, activeSources, refToSource) {
     const updates = [];
-    let inactiveLinks = 0;
 
     for (const [refId, sourceId] of refToSource) {
       const reference = scopedShapes.get(refId);
       const source = activeSources.get(sourceId);
-
-      if (!reference) continue;
-
-      // Source exists in Ontology but is currently ignored via underscore.
-      if (!source) {
-        inactiveLinks++;
-        continue;
-      }
+      if (!reference || !source) continue;
 
       if (reference.content !== source.item.content) {
         updates.push({ reference, source: source.item });
       }
     }
 
-    return { updates, inactiveLinks };
+    return updates;
   }
 
-  async function applyUpdatesInBatches(updates) {
+  async function applyUpdates(updates) {
     let updated = 0;
 
     for (let i = 0; i < updates.length; i += UPDATE_BATCH_SIZE) {
       const batch = updates.slice(i, i + UPDATE_BATCH_SIZE);
-
-      await Promise.all(
-        batch.map(async ({ reference, source }) => {
-          reference.content = source.content;
-          await reference.sync();
-        })
-      );
-
+      await Promise.all(batch.map(async ({ reference, source }) => {
+        reference.content = source.content;
+        await reference.sync();
+      }));
       updated += batch.length;
     }
 
     return updated;
   }
 
-  function countStoredReferences(state) {
-    let count = 0;
-    for (const refs of Object.values(state.r)) {
-      if (Array.isArray(refs)) count += refs.length;
-    }
-    return count;
+  function referenceCount(state) {
+    return Object.values(state.r).reduce(
+      (sum, refs) => sum + (Array.isArray(refs) ? refs.length : 0),
+      0
+    );
   }
 
   async function syncOnce() {
+    await miro.board.notifications.showInfo('SSOT Sync started');
+
     const state = await loadState();
-    const { ontologyFrame, decompositionFrames } = await getFrameStructure();
+    const { ontology, decomposition } = await getFrames();
 
-    const ontologyResult = await collectShapesRecursively([ontologyFrame]);
-    const scopeResult = await collectShapesRecursively(decompositionFrames);
+    const [ontologyShapes, scopedShapes] = await Promise.all([
+      collectShapes([ontology]),
+      collectShapes(decomposition)
+    ]);
 
-    const sourceResult = await buildSourceRegistry(ontologyResult.shapes, state);
-
-    const linkState = sanitizeStoredLinks(state, scopeResult.shapes);
-    const discoveryResult = discoverNewLinks(
-      scopeResult.shapes,
+    const sourceResult = registerSources(ontologyShapes, state);
+    const linkResult = sanitizeLinks(state, scopedShapes);
+    const discoveryResult = discoverLinks(
+      scopedShapes,
       sourceResult.active,
       state,
-      linkState.refToSource
+      linkResult.refToSource
     );
 
-    const updatePlan = buildUpdates(
-      scopeResult.shapes,
+    const updates = buildUpdates(
+      scopedShapes,
       sourceResult.active,
-      linkState.refToSource
+      linkResult.refToSource
     );
 
-    // Persist identities and newly discovered links before pushing visual
-    // updates. If an item update fails, the next Sync can safely resume.
-    const appDataBytes = await saveState(state);
-    const updated = await applyUpdatesInBatches(updatePlan.updates);
+    const stateBytes = await saveState(state);
+    const updated = await applyUpdates(updates);
 
     let message =
       `SSOT Sync · Sources: ${sourceResult.active.size}` +
-      ` · Decomposition frames: ${decompositionFrames.length}` +
-      ` · References: ${countStoredReferences(state)}` +
+      ` · References: ${referenceCount(state)}` +
       ` · New: ${discoveryResult.newLinks}` +
-      ` · Updated: ${updated}`;
+      ` · Updated: ${updated}` +
+      ` · Frames: ${decomposition.length}`;
 
-    if (sourceResult.renamedSources) {
-      message += ` · Renamed: ${sourceResult.renamedSources}`;
-    }
-    if (sourceResult.ignoredSources) {
-      message += ` · Ignored _: ${sourceResult.ignoredSources}`;
-    }
-    if (discoveryResult.ambiguous) {
-      message += ` · Ambiguous: ${discoveryResult.ambiguous}`;
-    }
-    if (linkState.prunedLinks) {
-      message += ` · Pruned: ${linkState.prunedLinks}`;
-    }
-    if (linkState.duplicateLinks) {
-      message += ` · Duplicates fixed: ${linkState.duplicateLinks}`;
-    }
-    if (updatePlan.inactiveLinks) {
-      message += ` · Inactive: ${updatePlan.inactiveLinks}`;
-    }
-
-    message += ` · State: ${Math.ceil(appDataBytes / 1024)} KB`;
+    if (sourceResult.renamed) message += ` · Renamed: ${sourceResult.renamed}`;
+    if (sourceResult.ignoredSources) message += ` · Ignored _: ${sourceResult.ignoredSources}`;
+    if (discoveryResult.ambiguous) message += ` · Ambiguous: ${discoveryResult.ambiguous}`;
+    if (linkResult.pruned) message += ` · Pruned: ${linkResult.pruned}`;
+    if (linkResult.duplicates) message += ` · Duplicates fixed: ${linkResult.duplicates}`;
+    message += ` · State: ${Math.ceil(stateBytes / 1024)} KB`;
 
     await miro.board.notifications.showInfo(message);
   }
@@ -440,13 +320,12 @@
     if (syncInProgress) {
       rerunRequested = true;
       await miro.board.notifications.showInfo(
-        'SSOT Sync is already running · one rerun queued'
+        'SSOT Sync already running · one rerun queued'
       );
       return;
     }
 
     syncInProgress = true;
-
     try {
       do {
         rerunRequested = false;
