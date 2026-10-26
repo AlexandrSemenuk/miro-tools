@@ -9,32 +9,8 @@
 <body>
 <script>
   const SSOT_KEY = 'portfolio_ssot';
-
-  const L0_ENTITIES = [
-    ['gameplay_layer', 'Gameplay Layer'],
-    ['booster_modifier_system', 'Booster / Modifier System'],
-    ['automation_system', 'Automation System'],
-    ['inventory_system', 'Inventory System'],
-    ['primary_resource_acquisition_system', 'Primary Resource Acquisition System'],
-    ['production_system', 'Production System'],
-    ['demand_fulfillment_system', 'Demand & Fulfillment System'],
-    ['purchase_system', 'Purchase System'],
-    ['progression_system', 'Progression System'],
-    ['collections_system', 'Collections System'],
-    ['social_system', 'Social System'],
-    ['competition_ranking_system', 'Competition & Ranking System'],
-    ['monetization_layer', 'Monetization Layer'],
-    ['commerce_system', 'Commerce System'],
-    ['advertising_system', 'Advertising System'],
-    ['liveops_layer', 'LiveOps Layer'],
-    ['events_system', 'Events System'],
-    ['developer_to_player_communication_system', 'Developer-to-Player Communication System'],
-    ['engagement_reward_system', 'Engagement & Reward System'],
-    ['platform_player_services_layer', 'Platform & Player Services Layer'],
-    ['platform_player_services_system', 'Platform & Player Services System'],
-    ['tutorial_guidance_layer', 'Tutorial & Guidance Layer'],
-    ['tutorial_guidance_system', 'Tutorial & Guidance System']
-  ];
+  const ONTOLOGY_FRAME_NAME = 'ontology';
+  const IGNORE_PREFIX = '_';
 
   function plainText(content) {
     const div = document.createElement('div');
@@ -42,132 +18,189 @@
     return (div.textContent ?? '').replace(/\s+/g, ' ').trim();
   }
 
+  function isEmpty(item) {
+    return plainText(item.content).length === 0;
+  }
+
+  function hasIgnorePrefix(item) {
+    return plainText(item.content).startsWith(IGNORE_PREFIX);
+  }
+
+  function createEntityId() {
+    if (globalThis.crypto?.randomUUID) {
+      return `ssot_${globalThis.crypto.randomUUID()}`;
+    }
+
+    return `ssot_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
   async function findOntologyFrame() {
     const frames = await miro.board.get({ type: 'frame' });
 
     let frame = frames.find(
-      item => (item.title ?? '').trim().toLowerCase() === 'ontology'
+      item => (item.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
     );
 
     if (frame) return frame;
 
-    // Fallback: find a frame that contains a child labelled "Ontology".
+    // Fallback: find a frame containing a child labelled "Ontology".
     for (const candidate of frames) {
       const children = await candidate.getChildren();
 
       const hasOntologyLabel = children.some(item => {
         if (item.type !== 'shape' && item.type !== 'text') return false;
-        return plainText(item.content).toLowerCase() === 'ontology';
+        return plainText(item.content).toLowerCase() === ONTOLOGY_FRAME_NAME;
       });
 
-      if (hasOntologyLabel) {
-        return candidate;
-      }
+      if (hasOntologyLabel) return candidate;
     }
 
     throw new Error('Ontology frame not found');
   }
 
-  async function setupL0() {
-    const ontologyFrame = await findOntologyFrame();
-    const ontologyChildren = await ontologyFrame.getChildren();
-    const ontologyShapes = ontologyChildren.filter(item => item.type === 'shape');
+  async function normalizeSources(ontologyShapes) {
+    const sources = new Map();
+    const sourceIdsInUse = new Set();
+    let newSources = 0;
+    let repairedSources = 0;
+    let ignoredSources = 0;
 
-    const allShapes = await miro.board.get({ type: 'shape' });
+    for (const source of ontologyShapes) {
+      if (isEmpty(source)) continue;
 
-    const missing = [];
-    let sourcesBound = 0;
-    let referencesBound = 0;
-
-    for (const [entityId, canonicalName] of L0_ENTITIES) {
-      const sourceCandidates = ontologyShapes.filter(
-        item => plainText(item.content) === canonicalName
-      );
-
-      if (sourceCandidates.length !== 1) {
-        missing.push(
-          `${canonicalName} (${sourceCandidates.length} candidates in Ontology)`
-        );
+      if (hasIgnorePrefix(source)) {
+        ignoredSources++;
         continue;
       }
 
-      const source = sourceCandidates[0];
+      const currentMeta = await source.getMetadata(SSOT_KEY);
+      let entityId = currentMeta?.entity_id;
 
-      await source.setMetadata(SSOT_KEY, {
-        entity_id: entityId,
-        field: 'name',
-        role: 'source'
-      });
+      // A copied canonical shape may carry the original source metadata.
+      // Every canonical shape inside Ontology must own a unique entity_id.
+      if (!entityId || sourceIdsInUse.has(entityId)) {
+        entityId = createEntityId();
+        newSources++;
+      }
 
-      sourcesBound++;
+      sourceIdsInUse.add(entityId);
 
-      for (const item of allShapes) {
-        if (item.id === source.id) continue;
-        if (plainText(item.content) !== canonicalName) continue;
+      const needsRepair =
+        currentMeta?.entity_id !== entityId ||
+        currentMeta?.role !== 'source' ||
+        currentMeta?.field !== 'content';
+
+      if (needsRepair) {
+        await source.setMetadata(SSOT_KEY, {
+          entity_id: entityId,
+          field: 'content',
+          role: 'source'
+        });
+
+        if (currentMeta?.entity_id) repairedSources++;
+      }
+
+      sources.set(entityId, source);
+    }
+
+    return {
+      sources,
+      newSources,
+      repairedSources,
+      ignoredSources
+    };
+  }
+
+  function buildSourcesByText(sources) {
+    const byText = new Map();
+
+    for (const [entityId, source] of sources) {
+      const text = plainText(source.content);
+      if (!text) continue;
+
+      const entries = byText.get(text) ?? [];
+      entries.push({ entityId, source });
+      byText.set(text, entries);
+    }
+
+    return byText;
+  }
+
+  async function bindReferences(allShapes, ontologyShapeIds, sources) {
+    const sourcesByText = buildSourcesByText(sources);
+    const references = [];
+
+    let newReferences = 0;
+    let repairedReferences = 0;
+    let ambiguousReferences = 0;
+    let orphanReferences = 0;
+
+    for (const item of allShapes) {
+      if (ontologyShapeIds.has(item.id)) continue;
+      if (isEmpty(item) || hasIgnorePrefix(item)) continue;
+
+      const meta = await item.getMetadata(SSOT_KEY);
+
+      // Existing links always win over text matching. This keeps references
+      // connected even after either side has been renamed.
+      if (meta?.entity_id) {
+        if (sources.has(meta.entity_id)) {
+          const needsRepair =
+            meta.role !== 'reference' || meta.field !== 'content';
+
+          if (needsRepair) {
+            await item.setMetadata(SSOT_KEY, {
+              entity_id: meta.entity_id,
+              field: 'content',
+              role: 'reference'
+            });
+            repairedReferences++;
+          }
+
+          references.push({ item, entityId: meta.entity_id });
+        } else {
+          orphanReferences++;
+        }
+
+        continue;
+      }
+
+      const text = plainText(item.content);
+      if (!text) continue;
+
+      const candidates = sourcesByText.get(text) ?? [];
+
+      if (candidates.length === 1) {
+        const entityId = candidates[0].entityId;
 
         await item.setMetadata(SSOT_KEY, {
           entity_id: entityId,
-          field: 'name',
+          field: 'content',
           role: 'reference'
         });
 
-        referencesBound++;
+        references.push({ item, entityId });
+        newReferences++;
+      } else if (candidates.length > 1) {
+        ambiguousReferences++;
       }
     }
 
-    if (missing.length) {
-      throw new Error(
-        `Setup incomplete. Missing/ambiguous canonical items: ${missing.join('; ')}`
-      );
-    }
-
-    return { sourcesBound, referencesBound };
+    return {
+      references,
+      newReferences,
+      repairedReferences,
+      ambiguousReferences,
+      orphanReferences
+    };
   }
 
-  async function collectBindings() {
-    const shapes = await miro.board.get({ type: 'shape' });
-
-    const sources = new Map();
-    const references = [];
-
-    for (const item of shapes) {
-      const meta = await item.getMetadata(SSOT_KEY);
-
-      if (!meta?.entity_id || !meta?.field || !meta?.role) {
-        continue;
-      }
-
-      const key = `${meta.entity_id}:${meta.field}`;
-
-      if (meta.role === 'source') {
-        sources.set(key, item);
-      } else if (meta.role === 'reference') {
-        references.push({ item, key });
-      }
-    }
-
-    return { sources, references };
-  }
-
-  async function syncAll() {
-    let { sources, references } = await collectBindings();
-    let setupResult = null;
-
-    if (sources.size < L0_ENTITIES.length) {
-      setupResult = await setupL0();
-      ({ sources, references } = await collectBindings());
-    }
-
+  async function syncReferences(references, sources) {
     let updated = 0;
-    let missingSources = 0;
 
-    for (const { item, key } of references) {
-      const source = sources.get(key);
-
-      if (!source) {
-        missingSources++;
-        continue;
-      }
+    for (const { item, entityId } of references) {
+      const source = sources.get(entityId);
+      if (!source) continue;
 
       if (item.content !== source.content) {
         item.content = source.content;
@@ -176,22 +209,45 @@
       }
     }
 
-    let message;
+    return updated;
+  }
 
-    if (setupResult) {
-      message =
-        `SSOT setup complete · Sources: ${setupResult.sourcesBound}` +
-        ` · References: ${setupResult.referencesBound}` +
-        ` · Updated: ${updated}`;
-    } else {
-      message =
-        `SSOT Sync complete · Sources: ${sources.size}` +
-        ` · References: ${references.length}` +
-        ` · Updated: ${updated}`;
+  async function syncAll() {
+    const ontologyFrame = await findOntologyFrame();
+    const ontologyChildren = await ontologyFrame.getChildren();
+    const ontologyShapes = ontologyChildren.filter(item => item.type === 'shape');
+    const ontologyShapeIds = new Set(ontologyShapes.map(item => item.id));
+
+    const allShapes = await miro.board.get({ type: 'shape' });
+
+    const sourceResult = await normalizeSources(ontologyShapes);
+    const referenceResult = await bindReferences(
+      allShapes,
+      ontologyShapeIds,
+      sourceResult.sources
+    );
+
+    const updated = await syncReferences(
+      referenceResult.references,
+      sourceResult.sources
+    );
+
+    let message =
+      `SSOT Sync complete · Sources: ${sourceResult.sources.size}` +
+      ` · References: ${referenceResult.references.length}` +
+      ` · New links: ${referenceResult.newReferences}` +
+      ` · Updated: ${updated}`;
+
+    if (sourceResult.ignoredSources) {
+      message += ` · Ignored _: ${sourceResult.ignoredSources}`;
     }
 
-    if (missingSources) {
-      message += ` · Missing sources: ${missingSources}`;
+    if (referenceResult.ambiguousReferences) {
+      message += ` · Ambiguous: ${referenceResult.ambiguousReferences}`;
+    }
+
+    if (referenceResult.orphanReferences) {
+      message += ` · Orphans: ${referenceResult.orphanReferences}`;
     }
 
     await miro.board.notifications.showInfo(message);
