@@ -8,10 +8,19 @@
 </head>
 <body>
 <script>
-  const SSOT_KEY = 'portfolio_ssot';
+  const APPDATA_KEY = 'portfolio_ssot_v6';
+  const LEGACY_METADATA_KEY = 'portfolio_ssot';
+
   const ONTOLOGY_FRAME_NAME = 'ontology';
+  const DECOMPOSITION_MARKER = 'decomposition';
   const IGNORE_PREFIX = '_';
+
   const MAX_ALIASES = 50;
+  const APPDATA_SOFT_LIMIT_BYTES = 28000;
+  const UPDATE_BATCH_SIZE = 12;
+
+  let syncInProgress = false;
+  let rerunRequested = false;
 
   function plainText(content) {
     const div = document.createElement('div');
@@ -24,314 +33,437 @@
     return !text || text.startsWith(IGNORE_PREFIX);
   }
 
-  function createEntityId(source) {
-    return `ssot_${source.id}`;
-  }
-
-  function normalizeAliases(rawAliases, currentText, previousText) {
-    const aliases = Array.isArray(rawAliases) ? rawAliases.filter(Boolean) : [];
-
-    if (previousText && previousText !== currentText) {
-      aliases.push(previousText);
-    }
-
-    const unique = [];
+  function normalizeAliases(values, currentText) {
+    const result = [];
     const seen = new Set();
 
-    for (const value of aliases) {
-      const text = String(value).replace(/\s+/g, ' ').trim();
+    for (const raw of values ?? []) {
+      const text = String(raw ?? '').replace(/\s+/g, ' ').trim();
       if (!text || text === currentText || seen.has(text)) continue;
       seen.add(text);
-      unique.push(text);
+      result.push(text);
     }
 
-    return unique.slice(-MAX_ALIASES);
+    return result.slice(-MAX_ALIASES);
   }
 
-  async function findOntologyFrame() {
+  function emptyState() {
+    return {
+      v: 6,
+      // source_id -> { t: last canonical text, a: aliases[] }
+      s: {},
+      // source_id -> [reference_id, ...]
+      r: {}
+    };
+  }
+
+  async function loadState() {
+    const raw = await miro.board.getAppData(APPDATA_KEY);
+
+    if (!raw || raw.v !== 6 || typeof raw !== 'object') {
+      return emptyState();
+    }
+
+    return {
+      v: 6,
+      s: raw.s && typeof raw.s === 'object' ? raw.s : {},
+      r: raw.r && typeof raw.r === 'object' ? raw.r : {}
+    };
+  }
+
+  async function saveState(state) {
+    const bytes = new TextEncoder().encode(JSON.stringify(state)).length;
+
+    if (bytes > APPDATA_SOFT_LIMIT_BYTES) {
+      throw new Error(
+        `SSOT state is too large (${bytes} bytes). AppData soft limit is ${APPDATA_SOFT_LIMIT_BYTES}.`
+      );
+    }
+
+    await miro.board.setAppData(APPDATA_KEY, state);
+    return bytes;
+  }
+
+  async function getFrameStructure() {
     const frames = await miro.board.get({ type: 'frame' });
 
-    const exact = frames.find(
-      item => (item.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
+    const ontologyFrame = frames.find(
+      frame => (frame.title ?? '').trim().toLowerCase() === ONTOLOGY_FRAME_NAME
     );
-    if (exact) return exact;
 
-    for (const frame of frames) {
+    if (!ontologyFrame) {
+      throw new Error('Ontology frame not found');
+    }
+
+    const decompositionFrames = frames.filter(frame => {
+      if (frame.id === ontologyFrame.id) return false;
+      return (frame.title ?? '').toLowerCase().includes(DECOMPOSITION_MARKER);
+    });
+
+    if (!decompositionFrames.length) {
+      throw new Error('No frames with "Decomposition" in the title were found');
+    }
+
+    return { ontologyFrame, decompositionFrames };
+  }
+
+  async function collectShapesRecursively(rootFrames) {
+    const shapes = new Map();
+    const visitedFrames = new Set();
+    const queue = [...rootFrames];
+
+    while (queue.length) {
+      const frame = queue.shift();
+      if (!frame || visitedFrames.has(frame.id)) continue;
+      visitedFrames.add(frame.id);
+
       const children = await frame.getChildren();
-      const hasLabel = children.some(item => {
-        if (item.type !== 'shape' && item.type !== 'text') return false;
-        return plainText(item.content).toLowerCase() === ONTOLOGY_FRAME_NAME;
-      });
-      if (hasLabel) return frame;
-    }
 
-    throw new Error('Ontology frame not found');
-  }
-
-  async function registerSources(ontologyShapes) {
-    const byEntityId = new Map();
-    const byLegacyEntityId = new Map();
-    const byItemId = new Map();
-    let registered = 0;
-    let ignored = 0;
-    let renamedSources = 0;
-    let clonedSourcesReset = 0;
-
-    for (const source of ontologyShapes) {
-      if (isIgnored(source)) {
-        ignored++;
-        continue;
-      }
-
-      const currentText = plainText(source.content);
-      const currentMeta = await source.getMetadata(SSOT_KEY);
-      const entityId = createEntityId(source);
-
-      // If a canonical source was created by copying another canonical source,
-      // Miro may also copy app metadata. Do not inherit the original source's
-      // identity or rename history.
-      const isClonedSource =
-        currentMeta?.source_item_id && currentMeta.source_item_id !== source.id;
-
-      if (isClonedSource) clonedSourcesReset++;
-
-      const previousText = isClonedSource ? null : currentMeta?.last_text;
-      const previousAliases = isClonedSource ? [] : currentMeta?.aliases;
-      const aliases = normalizeAliases(
-        previousAliases,
-        currentText,
-        previousText
-      );
-
-      if (previousText && previousText !== currentText) {
-        renamedSources++;
-      }
-
-      const sourceEntry = {
-        item: source,
-        entityId,
-        currentText,
-        aliases
-      };
-
-      // Migration path for older v3/v4 references that only know the old
-      // entity_id. Do not register copied foreign source metadata as legacy.
-      if (currentMeta?.entity_id && !isClonedSource) {
-        byLegacyEntityId.set(currentMeta.entity_id, sourceEntry);
-      }
-
-      await source.setMetadata(SSOT_KEY, {
-        entity_id: entityId,
-        source_item_id: source.id,
-        field: 'content',
-        role: 'source',
-        last_text: currentText,
-        aliases
-      });
-
-      byEntityId.set(entityId, sourceEntry);
-      byItemId.set(source.id, sourceEntry);
-      registered++;
-    }
-
-    return {
-      byEntityId,
-      byLegacyEntityId,
-      byItemId,
-      registered,
-      ignored,
-      renamedSources,
-      clonedSourcesReset
-    };
-  }
-
-  function buildSourcesByKnownText(sourceRegistry) {
-    const result = new Map();
-
-    function add(text, sourceEntry) {
-      if (!text) return;
-      const list = result.get(text) ?? [];
-      list.push(sourceEntry);
-      result.set(text, list);
-    }
-
-    for (const sourceEntry of sourceRegistry.byItemId.values()) {
-      add(sourceEntry.currentText, sourceEntry);
-      for (const alias of sourceEntry.aliases) add(alias, sourceEntry);
-    }
-
-    return result;
-  }
-
-  async function discoverReferences(allShapes, ontologyShapeIds, sourceRegistry) {
-    const sourcesByKnownText = buildSourcesByKnownText(sourceRegistry);
-    const links = [];
-
-    let newLinks = 0;
-    let repairedLinks = 0;
-    let recoveredByAlias = 0;
-    let ambiguous = 0;
-    let orphans = 0;
-
-    for (const item of allShapes) {
-      if (ontologyShapeIds.has(item.id)) continue;
-      if (isIgnored(item)) continue;
-
-      const meta = await item.getMetadata(SSOT_KEY);
-      let sourceEntry = null;
-      let matchedByText = false;
-
-      if (meta?.source_item_id) {
-        sourceEntry = sourceRegistry.byItemId.get(meta.source_item_id) ?? null;
-      }
-
-      if (!sourceEntry && meta?.entity_id) {
-        sourceEntry =
-          sourceRegistry.byEntityId.get(meta.entity_id) ??
-          sourceRegistry.byLegacyEntityId.get(meta.entity_id) ??
-          null;
-      }
-
-      // Recovery/discovery path. Uses both current canonical name and aliases.
-      if (!sourceEntry) {
-        const text = plainText(item.content);
-        const candidates = sourcesByKnownText.get(text) ?? [];
-
-        if (candidates.length === 1) {
-          sourceEntry = candidates[0];
-          matchedByText = true;
-
-          const isHistoricalName = text !== sourceEntry.currentText;
-          if (isHistoricalName) recoveredByAlias++;
-
-          if (meta?.entity_id || meta?.source_item_id) repairedLinks++;
-          else newLinks++;
-        } else if (candidates.length > 1) {
-          ambiguous++;
-          continue;
-        } else {
-          if (meta?.entity_id || meta?.source_item_id) orphans++;
-          continue;
+      for (const child of children) {
+        if (child.type === 'shape') {
+          shapes.set(child.id, child);
+        } else if (child.type === 'frame') {
+          queue.push(child);
         }
       }
+    }
 
-      await item.setMetadata(SSOT_KEY, {
-        entity_id: sourceEntry.entityId,
-        source_item_id: sourceEntry.item.id,
-        field: 'content',
-        role: 'reference'
-      });
+    return {
+      shapes,
+      frameCount: visitedFrames.size
+    };
+  }
 
-      links.push({
-        referenceId: item.id,
-        sourceId: sourceEntry.item.id,
-        entityId: sourceEntry.entityId,
-        matchedByText
+  async function seedSourceFromLegacyMetadata(source, currentText) {
+    try {
+      const legacy = await source.getMetadata(LEGACY_METADATA_KEY);
+
+      // Only import history that really belongs to this canonical item.
+      // Copies of another source may inherit foreign metadata; ignore it.
+      if (!legacy || legacy.source_item_id !== source.id) {
+        return { t: currentText, a: [] };
+      }
+
+      const aliases = [];
+
+      if (Array.isArray(legacy.aliases)) {
+        aliases.push(...legacy.aliases);
+      }
+
+      if (legacy.last_text && legacy.last_text !== currentText) {
+        aliases.push(legacy.last_text);
+      }
+
+      return {
+        t: currentText,
+        a: normalizeAliases(aliases, currentText)
+      };
+    } catch (_) {
+      return { t: currentText, a: [] };
+    }
+  }
+
+  async function buildSourceRegistry(ontologyShapes, state) {
+    const ontologyIds = new Set(ontologyShapes.keys());
+    const active = new Map();
+
+    let ignoredSources = 0;
+    let renamedSources = 0;
+    let newSources = 0;
+
+    // Remove sources that no longer exist in Ontology.
+    for (const sourceId of Object.keys(state.s)) {
+      if (!ontologyIds.has(sourceId)) {
+        delete state.s[sourceId];
+        delete state.r[sourceId];
+      }
+    }
+
+    for (const source of ontologyShapes.values()) {
+      const currentText = plainText(source.content);
+
+      // Keep existing state for ignored sources so links can resume if the
+      // underscore is later removed, but do not make them active.
+      if (!currentText || currentText.startsWith(IGNORE_PREFIX)) {
+        ignoredSources++;
+        continue;
+      }
+
+      let sourceState = state.s[source.id];
+
+      if (!sourceState) {
+        sourceState = await seedSourceFromLegacyMetadata(source, currentText);
+        state.s[source.id] = sourceState;
+        newSources++;
+      } else {
+        const previousText = String(sourceState.t ?? '').trim();
+        const aliases = Array.isArray(sourceState.a) ? [...sourceState.a] : [];
+
+        if (previousText && previousText !== currentText) {
+          aliases.push(previousText);
+          renamedSources++;
+        }
+
+        sourceState = {
+          t: currentText,
+          a: normalizeAliases(aliases, currentText)
+        };
+        state.s[source.id] = sourceState;
+      }
+
+      if (!state.r[source.id]) {
+        state.r[source.id] = [];
+      }
+
+      active.set(source.id, {
+        item: source,
+        currentText,
+        aliases: state.s[source.id].a ?? []
       });
     }
 
     return {
-      links,
-      newLinks,
-      repairedLinks,
-      recoveredByAlias,
-      ambiguous,
-      orphans
+      active,
+      ignoredSources,
+      renamedSources,
+      newSources
     };
   }
 
-  async function syncBoundReferences(links) {
-    const freshShapes = await miro.board.get({ type: 'shape' });
-    const byId = new Map(freshShapes.map(item => [item.id, item]));
+  function buildKnownTextIndex(activeSources) {
+    const index = new Map();
 
-    let updated = 0;
-    let missing = 0;
+    function add(text, sourceId) {
+      if (!text) return;
+      const set = index.get(text) ?? new Set();
+      set.add(sourceId);
+      index.set(text, set);
+    }
 
-    for (const link of links) {
-      const reference = byId.get(link.referenceId);
-      const source = byId.get(link.sourceId);
+    for (const [sourceId, source] of activeSources) {
+      add(source.currentText, sourceId);
+      for (const alias of source.aliases) {
+        add(alias, sourceId);
+      }
+    }
 
-      if (!reference || !source) {
-        missing++;
+    return index;
+  }
+
+  function sanitizeStoredLinks(state, scopedShapes) {
+    const activeScopedIds = new Set();
+
+    for (const item of scopedShapes.values()) {
+      if (!isIgnored(item)) activeScopedIds.add(item.id);
+    }
+
+    const refToSource = new Map();
+    let prunedLinks = 0;
+    let duplicateLinks = 0;
+
+    for (const [sourceId, refsRaw] of Object.entries(state.r)) {
+      if (!state.s[sourceId]) {
+        delete state.r[sourceId];
         continue;
       }
 
-      if (reference.content !== source.content) {
-        reference.content = source.content;
-        await reference.sync();
-        updated++;
+      const refs = Array.isArray(refsRaw) ? refsRaw : [];
+      const kept = [];
+
+      for (const refId of refs) {
+        if (!activeScopedIds.has(refId)) {
+          prunedLinks++;
+          continue;
+        }
+
+        if (refToSource.has(refId)) {
+          duplicateLinks++;
+          continue;
+        }
+
+        refToSource.set(refId, sourceId);
+        kept.push(refId);
       }
 
-      await reference.setMetadata(SSOT_KEY, {
-        entity_id: link.entityId,
-        source_item_id: link.sourceId,
-        field: 'content',
-        role: 'reference'
-      });
+      state.r[sourceId] = kept;
     }
 
-    return { updated, missing };
+    return {
+      refToSource,
+      activeScopedIds,
+      prunedLinks,
+      duplicateLinks
+    };
   }
 
-  async function syncAll() {
-    const ontologyFrame = await findOntologyFrame();
-    const ontologyChildren = await ontologyFrame.getChildren();
-    const ontologyShapes = ontologyChildren.filter(item => item.type === 'shape');
-    const ontologyShapeIds = new Set(ontologyShapes.map(item => item.id));
+  function discoverNewLinks(scopedShapes, activeSources, state, refToSource) {
+    const knownText = buildKnownTextIndex(activeSources);
 
-    const sourceRegistry = await registerSources(ontologyShapes);
-    const allShapes = await miro.board.get({ type: 'shape' });
+    let newLinks = 0;
+    let ambiguous = 0;
+    let unmatched = 0;
 
-    const referenceResult = await discoverReferences(
-      allShapes,
-      ontologyShapeIds,
-      sourceRegistry
+    for (const item of scopedShapes.values()) {
+      if (isIgnored(item)) continue;
+      if (refToSource.has(item.id)) continue;
+
+      const text = plainText(item.content);
+      const candidates = [...(knownText.get(text) ?? [])];
+
+      if (candidates.length === 1) {
+        const sourceId = candidates[0];
+        state.r[sourceId] = state.r[sourceId] ?? [];
+        state.r[sourceId].push(item.id);
+        refToSource.set(item.id, sourceId);
+        newLinks++;
+      } else if (candidates.length > 1) {
+        ambiguous++;
+      } else {
+        unmatched++;
+      }
+    }
+
+    return { newLinks, ambiguous, unmatched };
+  }
+
+  function buildUpdates(scopedShapes, activeSources, refToSource) {
+    const updates = [];
+    let inactiveLinks = 0;
+
+    for (const [refId, sourceId] of refToSource) {
+      const reference = scopedShapes.get(refId);
+      const source = activeSources.get(sourceId);
+
+      if (!reference) continue;
+
+      // Source exists in Ontology but is currently ignored via underscore.
+      if (!source) {
+        inactiveLinks++;
+        continue;
+      }
+
+      if (reference.content !== source.item.content) {
+        updates.push({ reference, source: source.item });
+      }
+    }
+
+    return { updates, inactiveLinks };
+  }
+
+  async function applyUpdatesInBatches(updates) {
+    let updated = 0;
+
+    for (let i = 0; i < updates.length; i += UPDATE_BATCH_SIZE) {
+      const batch = updates.slice(i, i + UPDATE_BATCH_SIZE);
+
+      await Promise.all(
+        batch.map(async ({ reference, source }) => {
+          reference.content = source.content;
+          await reference.sync();
+        })
+      );
+
+      updated += batch.length;
+    }
+
+    return updated;
+  }
+
+  function countStoredReferences(state) {
+    let count = 0;
+    for (const refs of Object.values(state.r)) {
+      if (Array.isArray(refs)) count += refs.length;
+    }
+    return count;
+  }
+
+  async function syncOnce() {
+    const state = await loadState();
+    const { ontologyFrame, decompositionFrames } = await getFrameStructure();
+
+    const ontologyResult = await collectShapesRecursively([ontologyFrame]);
+    const scopeResult = await collectShapesRecursively(decompositionFrames);
+
+    const sourceResult = await buildSourceRegistry(ontologyResult.shapes, state);
+
+    const linkState = sanitizeStoredLinks(state, scopeResult.shapes);
+    const discoveryResult = discoverNewLinks(
+      scopeResult.shapes,
+      sourceResult.active,
+      state,
+      linkState.refToSource
     );
 
-    const syncResult = await syncBoundReferences(referenceResult.links);
+    const updatePlan = buildUpdates(
+      scopeResult.shapes,
+      sourceResult.active,
+      linkState.refToSource
+    );
+
+    // Persist identities and newly discovered links before pushing visual
+    // updates. If an item update fails, the next Sync can safely resume.
+    const appDataBytes = await saveState(state);
+    const updated = await applyUpdatesInBatches(updatePlan.updates);
 
     let message =
-      `SSOT Sync · Sources: ${sourceRegistry.registered}` +
-      ` · References: ${referenceResult.links.length}` +
-      ` · New links: ${referenceResult.newLinks}` +
-      ` · Updated: ${syncResult.updated}`;
+      `SSOT Sync · Sources: ${sourceResult.active.size}` +
+      ` · Decomposition frames: ${decompositionFrames.length}` +
+      ` · References: ${countStoredReferences(state)}` +
+      ` · New: ${discoveryResult.newLinks}` +
+      ` · Updated: ${updated}`;
 
-    if (referenceResult.recoveredByAlias) {
-      message += ` · Recovered: ${referenceResult.recoveredByAlias}`;
+    if (sourceResult.renamedSources) {
+      message += ` · Renamed: ${sourceResult.renamedSources}`;
     }
-    if (referenceResult.repairedLinks) {
-      message += ` · Repaired: ${referenceResult.repairedLinks}`;
+    if (sourceResult.ignoredSources) {
+      message += ` · Ignored _: ${sourceResult.ignoredSources}`;
     }
-    if (sourceRegistry.clonedSourcesReset) {
-      message += ` · Source clones reset: ${sourceRegistry.clonedSourcesReset}`;
+    if (discoveryResult.ambiguous) {
+      message += ` · Ambiguous: ${discoveryResult.ambiguous}`;
     }
-    if (sourceRegistry.ignored) {
-      message += ` · Ignored _: ${sourceRegistry.ignored}`;
+    if (linkState.prunedLinks) {
+      message += ` · Pruned: ${linkState.prunedLinks}`;
     }
-    if (referenceResult.ambiguous) {
-      message += ` · Ambiguous: ${referenceResult.ambiguous}`;
+    if (linkState.duplicateLinks) {
+      message += ` · Duplicates fixed: ${linkState.duplicateLinks}`;
     }
-    if (referenceResult.orphans) {
-      message += ` · Orphans: ${referenceResult.orphans}`;
+    if (updatePlan.inactiveLinks) {
+      message += ` · Inactive: ${updatePlan.inactiveLinks}`;
     }
-    if (syncResult.missing) {
-      message += ` · Missing items: ${syncResult.missing}`;
-    }
+
+    message += ` · State: ${Math.ceil(appDataBytes / 1024)} KB`;
 
     await miro.board.notifications.showInfo(message);
   }
 
+  async function handleSyncClick() {
+    if (syncInProgress) {
+      rerunRequested = true;
+      await miro.board.notifications.showInfo(
+        'SSOT Sync is already running · one rerun queued'
+      );
+      return;
+    }
+
+    syncInProgress = true;
+
+    try {
+      do {
+        rerunRequested = false;
+        await syncOnce();
+      } while (rerunRequested);
+    } catch (error) {
+      console.error('SSOT Sync failed:', error);
+      await miro.board.notifications.showError(
+        `SSOT Sync failed: ${error.message ?? 'Unknown error'}`
+      );
+    } finally {
+      syncInProgress = false;
+    }
+  }
+
   async function init() {
-    await miro.board.ui.on('icon:click', async () => {
-      try {
-        await syncAll();
-      } catch (error) {
-        console.error('SSOT Sync failed:', error);
-        await miro.board.notifications.showError(
-          `SSOT Sync failed: ${error.message ?? 'Unknown error'}`
-        );
-      }
-    });
+    await miro.board.ui.on('icon:click', handleSyncClick);
   }
 
   init();
