@@ -10,7 +10,84 @@
 <script>
   const SSOT_KEY = 'portfolio_ssot';
 
-  async function syncAll() {
+  const L0_ENTITIES = [
+    { entity_id: 'gameplay_layer', source_id: '3458764688487971212', canonical_name: 'Gameplay Layer' },
+
+    { entity_id: 'booster_modifier_system', source_id: '3458764688487772502', canonical_name: 'Booster / Modifier System' },
+    { entity_id: 'automation_system', source_id: '3458764688487772493', canonical_name: 'Automation System' },
+    { entity_id: 'inventory_system', source_id: '3458764688487772489', canonical_name: 'Inventory System' },
+    { entity_id: 'primary_resource_acquisition_system', source_id: '3458764688487772492', canonical_name: 'Primary Resource Acquisition System' },
+    { entity_id: 'production_system', source_id: '3458764688487772491', canonical_name: 'Production System' },
+    { entity_id: 'demand_fulfillment_system', source_id: '3458764688487772488', canonical_name: 'Demand & Fulfillment System' },
+    { entity_id: 'purchase_system', source_id: '3458764688487772500', canonical_name: 'Purchase System' },
+    { entity_id: 'progression_system', source_id: '3458764688487772490', canonical_name: 'Progression System' },
+    { entity_id: 'collections_system', source_id: '3458764688487772505', canonical_name: 'Collections System' },
+    { entity_id: 'social_system', source_id: '3458764688487772487', canonical_name: 'Social System' },
+    { entity_id: 'competition_ranking_system', source_id: '3458764688487772507', canonical_name: 'Competition & Ranking System' },
+
+    { entity_id: 'monetization_layer', source_id: '3458764688487873163', canonical_name: 'Monetization Layer' },
+    { entity_id: 'commerce_system', source_id: '3458764688487772517', canonical_name: 'Commerce System' },
+    { entity_id: 'advertising_system', source_id: '3458764688487772518', canonical_name: 'Advertising System' },
+
+    { entity_id: 'liveops_layer', source_id: '3458764688487873162', canonical_name: 'LiveOps Layer' },
+    { entity_id: 'events_system', source_id: '3458764688487772511', canonical_name: 'Events System' },
+    { entity_id: 'developer_to_player_communication_system', source_id: '3458764688487772510', canonical_name: 'Developer-to-Player Communication System' },
+    { entity_id: 'engagement_reward_system', source_id: '3458764688487772512', canonical_name: 'Engagement & Reward System' },
+
+    { entity_id: 'platform_player_services_layer', source_id: '3458764688487873161', canonical_name: 'Platform & Player Services Layer' },
+    { entity_id: 'platform_player_services_system', source_id: '3458764688487772509', canonical_name: 'Platform & Player Services System' },
+
+    { entity_id: 'tutorial_guidance_layer', source_id: '3458764688490670990', canonical_name: 'Tutorial & Guidance Layer' },
+    { entity_id: 'tutorial_guidance_system', source_id: '3458764688491057330', canonical_name: 'Tutorial & Guidance System' }
+  ];
+
+  function plainText(content) {
+    const div = document.createElement('div');
+    div.innerHTML = content ?? '';
+    return (div.textContent ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  async function setupL0() {
+    const shapes = await miro.board.get({ type: 'shape' });
+    const byId = new Map(shapes.map(item => [item.id, item]));
+
+    let sourcesBound = 0;
+    let referencesBound = 0;
+
+    for (const entity of L0_ENTITIES) {
+      const source =
+        byId.get(entity.source_id) ??
+        await miro.board.getById(entity.source_id);
+
+      await source.setMetadata(SSOT_KEY, {
+        entity_id: entity.entity_id,
+        field: 'name',
+        role: 'source'
+      });
+
+      sourcesBound++;
+
+      for (const item of shapes) {
+        if (item.id === source.id) continue;
+
+        // Bind existing references by the approved canonical name.
+        // This still works if the source has already been temporarily renamed.
+        if (plainText(item.content) !== entity.canonical_name) continue;
+
+        await item.setMetadata(SSOT_KEY, {
+          entity_id: entity.entity_id,
+          field: 'name',
+          role: 'reference'
+        });
+
+        referencesBound++;
+      }
+    }
+
+    return { sourcesBound, referencesBound };
+  }
+
+  async function collectBindings() {
     const shapes = await miro.board.get({ type: 'shape' });
 
     const sources = new Map();
@@ -27,11 +104,23 @@
 
       if (meta.role === 'source') {
         sources.set(key, item);
-      }
-
-      if (meta.role === 'reference') {
+      } else if (meta.role === 'reference') {
         references.push({ item, key });
       }
+    }
+
+    return { sources, references };
+  }
+
+  async function syncAll() {
+    let { sources, references } = await collectBindings();
+    let setupResult = null;
+
+    // First run inside the actual SSOT Sync app:
+    // initialize metadata in this app's own metadata namespace.
+    if (sources.size === 0) {
+      setupResult = await setupL0();
+      ({ sources, references } = await collectBindings());
     }
 
     let updated = 0;
@@ -52,9 +141,17 @@
       }
     }
 
-    const message =
-      `SSOT Sync complete · Updated: ${updated}` +
-      (missingSources ? ` · Missing sources: ${missingSources}` : '');
+    let message =
+      `SSOT Sync complete · Sources: ${sources.size} · References: ${references.length} · Updated: ${updated}`;
+
+    if (setupResult) {
+      message =
+        `SSOT setup complete · Sources: ${setupResult.sourcesBound} · References: ${setupResult.referencesBound} · Updated: ${updated}`;
+    }
+
+    if (missingSources) {
+      message += ` · Missing sources: ${missingSources}`;
+    }
 
     await miro.board.notifications.showInfo(message);
   }
