@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SSOT Sync v8</title>
+  <title>SSOT Sync v9</title>
   <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
 </head>
 <body>
@@ -308,7 +308,7 @@
 
       await miro.board.notifications.showInfo(message);
     } catch (error) {
-      console.error('SSOT Sync v8 failed:', error);
+      console.error('SSOT Sync v9 failed:', error);
       await miro.board.notifications.showError(
         `SSOT Sync failed: ${error.message ?? 'Unknown error'}`
       );
@@ -319,32 +319,6 @@
 
   async function init() {
     await miro.board.ui.on('icon:click', handleSync);
-
-    // Quick pair action in the context menu for selected shapes.
-    // Miro supports single/multi selection predicates, but not an exact count of 2,
-    // so handleSync performs the final validation.
-    await miro.board.ui.on('custom:ssot-pair', handleSync);
-
-    await miro.board.experimental.action.register({
-      event: 'ssot-pair',
-      ui: {
-        label: {
-          en: 'SSOT Pair'
-        },
-        icon: 'chat-two',
-        description: {
-          en: 'Link two selected shapes and sync their SSOT relationship.'
-        }
-      },
-      scope: 'local',
-      selection: 'multi',
-      predicate: {
-        type: 'shape'
-      },
-      contexts: {
-        item: {}
-      }
-    });
   }
 
   init();
